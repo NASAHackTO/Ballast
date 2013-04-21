@@ -1,0 +1,455 @@
+#!/usr/bin/perl -T
+#
+# Copyright (C) 2010 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration
+# (NASA).  All Rights Reserved.
+#
+# This software is distributed under the NASA Open Source Agreement
+# (NOSA), version 1.3.  The NOSA has been approved by the Open Source
+# Initiative.  See http://www.opensource.org/licenses/nasa1.3.php
+# for the complete NOSA document.
+#
+# THE SUBJECT SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY OF ANY
+# KIND, EITHER EXPRESSED, IMPLIED, OR STATUTORY, INCLUDING, BUT NOT
+# LIMITED TO, ANY WARRANTY THAT THE SUBJECT SOFTWARE WILL CONFORM TO
+# SPECIFICATIONS, ANY IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+# A PARTICULAR PURPOSE, OR FREEDOM FROM INFRINGEMENT, ANY WARRANTY THAT
+# THE SUBJECT SOFTWARE WILL BE ERROR FREE, OR ANY WARRANTY THAT
+# DOCUMENTATION, IF PROVIDED, WILL CONFORM TO THE SUBJECT SOFTWARE. THIS
+# AGREEMENT DOES NOT, IN ANY MANNER, CONSTITUTE AN ENDORSEMENT BY
+# GOVERNMENT AGENCY OR ANY PRIOR RECIPIENT OF ANY RESULTS, RESULTING
+# DESIGNS, HARDWARE, SOFTWARE PRODUCTS OR ANY OTHER APPLICATIONS RESULTING
+# FROM USE OF THE SUBJECT SOFTWARE.  FURTHER, GOVERNMENT AGENCY DISCLAIMS
+# ALL WARRANTIES AND LIABILITIES REGARDING THIRD-PARTY SOFTWARE, IF
+# PRESENT IN THE ORIGINAL SOFTWARE, AND DISTRIBUTES IT "AS IS".
+#
+# RECIPIENT AGREES TO WAIVE ANY AND ALL CLAIMS AGAINST THE UNITED STATES
+# GOVERNMENT, ITS CONTRACTORS AND SUBCONTRACTORS, AS WELL AS ANY PRIOR
+# RECIPIENT.  IF RECIPIENT'S USE OF THE SUBJECT SOFTWARE RESULTS IN ANY
+# LIABILITIES, DEMANDS, DAMAGES, EXPENSES OR LOSSES ARISING FROM SUCH USE,
+# INCLUDING ANY DAMAGES FROM PRODUCTS BASED ON, OR RESULTING FROM,
+# RECIPIENT'S USE OF THE SUBJECT SOFTWARE, RECIPIENT SHALL INDEMNIFY AND
+# HOLD HARMLESS THE UNITED STATES GOVERNMENT, ITS CONTRACTORS AND
+# SUBCONTRACTORS, AS WELL AS ANY PRIOR RECIPIENT, TO THE EXTENT PERMITTED
+# BY LAW.  RECIPIENT'S SOLE REMEDY FOR ANY SUCH MATTER SHALL BE THE
+# IMMEDIATE, UNILATERAL TERMINATION OF THIS AGREEMENT.
+#
+
+package Ballast;
+
+use base qw(Net::Server::MultiType);
+use strict;
+use Fcntl;
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use MIME::Base64;
+use MLDBM qw(DB_File);
+use MLDBM::Sync;
+use Storable qw(thaw);
+
+our $VERSION = 0.17;
+
+# default configuration
+my %conf = (
+    alias_last => "-last",
+    conf_file => "/etc/ballastrc",
+    data_port => 4411,
+    host_timeout => 180,
+    key_file => "/etc/ballast.key",
+    run_setsid => 1,
+    syslog_facility => "syslog",
+    syslog_ident => "ballast",
+    syslog_logopt => "ndelay,pid",
+    user_sum => "cpu mem ram io_bytes io_ops io_reads io_read_bytes io_writes io_write_bytes",
+);
+
+# parse parameters (preserve @ARGV for Net::Server)
+my @save_argv = @ARGV;
+GetOptions(\%conf, "conf_file|c=s") or die "Invalid options\n";
+@ARGV = @save_argv;
+
+# parse configuration
+my $paren_re;
+$paren_re = qr{\((?:(?>[^()]+)|(??{$paren_re}))*\)}x;
+open(FILE, $conf{conf_file}) or die "Unable to load config file: $!\n";
+my $mline;
+while (my $line = <FILE>) {
+    # strip whitespace and comments
+    $line =~ s/^\s+|\s+$|\s*#.*//g;
+    next if (!$line);
+    # support line continuation operator
+    $mline .= $line;
+    next if ($mline =~ s/\s*\\$/ /);
+    if ($mline =~ /^(\S+)\s+(.*)/) {
+        my ($key, $val) = ($1, $2);
+        if ($key =~ /^policy_/) {
+            $val =~ s/(?!(?:cmp|eq|le|lt|ge|gt|ne)\W)(?<!\w)((?:abs|product|q|qr|sum)\s*$paren_re|[a-zA-Z]\w*)/load(q{$1})/g;
+        }
+        $conf{$key} = $val;
+    }
+    $mline = undef;
+}
+close FILE;
+
+# set up encryption if configured
+if (exists $conf{data_cipher}) {
+    open(FILE, $conf{key_file}) or die "Unable to load key file: $!\n";
+    my $key = <FILE>;
+    close FILE;
+
+    # untaint key
+    $key = $1 if ($key =~ /(.*)/);
+
+    require Crypt::CBC;
+    $conf{-cbc} = Crypt::CBC->new(
+        -key => $key,
+        -cipher => $conf{data_cipher},
+    );
+}
+
+# tie persistent load database to hash
+my %load;
+my $sync = tie(%load, 'MLDBM::Sync', $conf{data_db}, O_RDWR | O_CREAT, 0600) or
+    die "Unable to tie load database: $!\n";
+
+# function to handle evaluation of policy expressions
+my %load_vars;
+sub load {
+    my $expr = shift;
+    $expr =~ s/^\s+|\s+$//g;
+    my $return;
+    if ($expr =~ /q\s*\((.*)\)/) {
+        # quote operator
+        return $1;
+    } elsif ($expr =~ /qr\s*\((.*)\)/) {
+        # regex quote operator
+        return qr($1);
+    } elsif ($expr =~ /abs\s*\((.*)\)/) {
+        # absolute value
+        return abs(eval $1);
+    } elsif ($expr =~ /(sum|product)\s*\((.*)\)/) {
+        my ($op, $arg0) = ($1, $2);
+        my $result = $op eq 'sum' ? 0 : 1;
+        foreach my $sid (grep(/^$load_vars{host}:sid_/, keys(%load))) {
+            my $uid = $load{$sid};
+            if ($uid =~ /(?:^|\s)uid:(\d+)/) {
+                $uid = $1;
+                my $arg = $arg0;
+                $arg =~ s/user_i_/uid_$uid\_/g;
+                $arg =~ s/((?:sum|product)\s*$paren_re|[a-zA-Z]\w*)/load(q{$1})/g;
+                my $val = eval $arg;
+                $result = $op eq 'sum' ? $result + $val : $result * $val;
+            }
+        }
+        $return = $result;
+    } elsif ($expr =~ /(uid_\d+|user)_(\w+)/) {
+        my ($uid, $metric) = ($1, $2);
+        if ($uid eq 'user') {
+            $uid = $load_vars{uid};
+        } else {
+            $uid =~ s/\D*//g;
+        }
+        my $rank = $metric =~ s/_rank$//;
+
+        my $uval = $load{"uid_$uid"};
+        if ($uval =~ /(?:^|\s)$metric:(\S+)/) {
+            $uval = $1;
+            if ($rank) {
+                # higher rank indicates higher usage
+                foreach my $uid (grep(/^uid_/, keys(%load))) {
+                    # increase rank for any users with higher value of given metric
+                    $rank++ if ($load{$uid} =~ /(?:^|\s)$metric:(\S+)/ && $1 < $uval);
+                }
+                $return = $rank;
+            } else {
+                $return = $uval;
+            }
+        }
+    } elsif ($expr eq 'user_uid') {
+        $return = $load_vars{uid};
+    } elsif ($expr eq 'users') {
+        $return = $load{users};
+    } elsif ($expr eq 'random') {
+        $return = int(rand(100)) + 1;
+    } elsif ($expr =~ /^arg(\d+)$/) {
+        $return = $load_vars{args}->[$1];
+    } elsif ($expr eq 'client_ip') {
+        $return = $load_vars{client_ip};
+    } else {
+        $return = $load{"$load_vars{host}:$expr"};
+    }
+    # return default value of 1 if return not defined
+    return defined $return ? $return : 1;
+}
+
+# called by Net::Server on accepted connection when multiplexed
+sub mux_input {
+    my ($self, $mux, $fh, $data) = @_;
+    while ($$data =~ s/^(.*?)\r?\n//) {
+        process_common($self->{net_server}, $1);
+    }
+}
+
+# called by Net::Server on accepted connection when forked
+sub process_request {
+    my $self = shift;
+    while (<STDIN>) {
+        s/\r?\n$//;
+        process_common($self, $_);
+    }
+}
+
+# common processing for both multiplexed and forked
+sub process_common {
+    my ($self, $text) = @_;
+    if ($text =~ /^#/) {
+        substr($text, 0, 1) = "";
+        update_load($self, $text);
+    } elsif ($text =~ /^([\w-]+)\s+(\d+)(.*)$/) {
+        select_host($self, $1, $2, $3);
+    }
+}
+
+# select host for client
+sub select_host {
+    my ($self, $alias, $uid, $args) = @_;
+    # set client_ip for logging and load function
+    $load_vars{client_ip} = $self->{server}->{peeraddr};
+    my $last = $alias =~ s/$conf{alias_last}$// ? $conf{alias_last} : "";
+    my $return = "";
+    if ($last && exists $load{"last_$alias\_$uid"}) {
+        # return last host selected
+        $return = $load{"last_$alias\_$uid"};
+    } else {
+        # find hosts that map to given alias
+        my @hosts = grep(/:alias$/, keys(%load));
+        my @min_hosts;
+        my $min;
+        my $time = time;
+        # set uid for load function
+        $load_vars{uid} = $uid;
+        # set args for load function
+        $args =~ s/^\s+|\s+$//g;
+        $load_vars{args} = [split(/\s+/, $args)];
+        # set data alias
+        my $data_alias = $conf{"data_alias_$alias"};
+        $data_alias = $alias if (!$data_alias);
+        $sync->ReadLock;
+        foreach my $host (grep(/:alias$/, keys(%load))) {
+            next if ($data_alias !~ qr/(?:^|\s)$load{$host}(?:$|\s)/);
+            $host =~ s/:alias//;
+            if ($time > $load{"$host:time"} + $conf{host_timeout}) {
+                # assume host down if host_timeout elapsed
+                $self->log(4, "ignoring stale data for host $host");
+                next;
+            }
+            # set host for load function
+            $load_vars{host} = $host;
+            my $val = eval($conf{"policy_$alias"});
+            $self->log(4,
+                "host $host evaluates to $val for $alias/$uid from $load_vars{client_ip}");
+            if (0 <= $val && (!defined $min || $val < $min)) {
+                @min_hosts = ($host);
+                $min = $val;
+            } elsif (defined $min && $val == $min) {
+                push(@min_hosts, $host);
+            }
+        }
+        $sync->UnLock;
+        $return = $min_hosts[int(rand(scalar(@min_hosts)))]
+            if (scalar(@min_hosts) > 0);
+    }
+    $load{"last_$alias\_$uid"} = $return if ($return);
+    $self->log(2,
+        "$alias$last/$uid returns \"$return\" to $load_vars{client_ip}");
+    print "$return\n";
+}
+
+# find ssh session pid from any currently running pid
+sub session_id {
+    my ($load_ref, $pid) = @_;
+    my $proc = $load_ref->{$pid};
+    if ($proc =~ /(?:^|\s)cmd:(?:sshd|dropbear)/) {
+        # process is ssh server fork so return pid
+        $pid =~ s/^p/s/;
+        return $pid;
+    } elsif ($proc =~ /(?:^|\s)ppid:(\d+)/) {
+        # recursively compute session from parent pid
+        return session_id($load_ref, "pid_$1");
+    } else {
+        # session unknown if no parent pid
+        return "sid_unknown";
+    }
+}
+
+# update load data from agent
+sub update_load {
+    my ($self, $text) = @_;
+    if (exists $conf{data_cipher}) {
+        # decrypt data if specified
+        $text = $conf{-cbc}->decrypt_hex($text);
+    } else {
+        # decode data when not encrypted
+        $text = decode_base64($text);
+    }
+    return if ($text !~ s/^#ballast#//);
+    my %load_new = %{thaw($text)};
+    my $host = $load_new{host};
+    return if (!$host);
+
+    # gather previous load for host
+    my $colon = length($host) + 1;
+    my %load_old;
+    $sync->ReadLock;
+    foreach my $key (grep(/^$host:/, keys %load)) {
+        $load_old{substr($key, $colon)} = $load{$key};
+    }
+    $sync->UnLock;
+
+    # update differential loads
+    foreach my $abs (grep(/^d_/, keys %load_new)) {
+        my $diff = substr($abs, 2);
+        $load_new{$diff} = $load_new{$abs} - $load_old{$abs};
+        # scale difference based on 60 second interval
+        my $scale = $load_new{time} - $load_old{time};
+        $load_new{$diff} *= 60.0 / $scale if ($scale > 0);
+    }
+
+    # update session totals for dead processes
+    foreach my $pid (grep(/^pid_/, keys %load_old)) {
+        next if (exists $load_new{$pid});
+        my $sid = session_id(\%load_old, $pid);
+        next if ($sid eq 'sid_unknown');
+        my %sess = map {split(/:/, $_)} split(/\s+/, $load_old{$sid});
+        my %proc = map {split(/:/, $_)} split(/\s+/, $load_old{$pid});
+        foreach my $key (split(/\s+/, $conf{user_sum})) {
+            $sess{"dead_$key"} += $proc{$key};
+        }
+        # store updated session
+        $load_old{$sid} = join(" ", map {"$_:$sess{$_}"} keys(%sess));
+    }
+
+    # update session totals
+    foreach my $pid (grep(/^pid_/, keys %load_new)) {
+        my $sid = session_id(\%load_new, $pid);
+        next if ($sid eq 'sid_unknown');
+        my $load_ref = exists $load_new{$sid} ? \%load_new : \%load_old;
+        my %sess = map {split(/:/, $_)} split(/\s+/, $load_ref->{$sid});
+        my %proc = map {split(/:/, $_)} split(/\s+/, $load_new{$pid});
+        if ($sess{last} != $load_new{time}) {
+            $sess{last} = $load_new{time};
+            # clear session totals
+            foreach my $key (split(/\s+/, $conf{user_sum})) {
+                $sess{$key} = 0;
+            }
+        }
+        foreach my $key (split(/\s+/, $conf{user_sum})) {
+            $sess{$key} += $proc{$key};
+        }
+        $sess{time} = $proc{time} if ($sess{time} < $proc{time});
+        $sess{uid} = $proc{uid} if ($proc{uid} != 0);
+        # store updated session
+        $load_new{$sid} = join(" ", map {"$_:$sess{$_}"} keys(%sess));
+    }
+
+    # update sessions
+    $load_new{sessions} = 0;
+    foreach my $sid (grep(/^sid_/, keys %load_new)) {
+        my %sess = map {split(/:/, $_)} split(/\s+/, $load_new{$sid});
+        if (!$sess{uid}) {
+            # ignore sessions with root or undefined uid
+            delete $load_new{$sid};
+            next;
+        }
+        $load_new{sessions}++;
+
+        # add in totals from dead processes
+        foreach my $key (split(/\s+/, $conf{user_sum})) {
+            $sess{$key} += $sess{"dead_$key"};
+        }
+        $load_new{$sid} = join(" ", map {"$_:$sess{$_}"} keys(%sess));
+    }
+
+    # update user totals
+    my %uids;
+    foreach my $sid (grep(/^sid_/, keys %load_old)) {
+        next if (exists $load_new{$sid});
+        my %sess = map {split(/:/, $_)} split(/\s+/, $load_old{$sid});
+        # ignore sessions with root or undefined uid
+        next if (!$sess{uid});
+        my $uid = "uid_$sess{uid}";
+        my %user = map {split(/:/, $_)} split(/\s+/, $uids{$uid});
+        $user{sessions}++;
+        foreach my $key (split(/\s+/, "time $conf{user_sum}")) {
+            $user{$key} += ($sess{$key} - $user{$key}) / $user{sessions};
+        }
+        # store updated user
+        $uids{$uid} = join(" ", map {"$_:$user{$_}"} keys(%user));
+    }
+
+    $sync->Lock;
+    # update stored load data
+    while (my ($key, $val) = each %load_new) {
+        $load{"$host:$key"} = $val;
+    }
+    # update user running averages
+    while (my ($uid, $user_new) = each %uids) {
+        my $user_old = $load{$uid};
+        if ($user_old) {
+            # update running average of each field
+            my %user_old = map {split(/:/, $_)} split(/\s+/, $user_old);
+            my %user_new = map {split(/:/, $_)} split(/\s+/, $user_new);
+            $user_new{sessions} += $user_old{sessions};
+            foreach my $key (split(/\s+/, "time $conf{user_sum}")) {
+                $user_new{$key} += ($user_old{$key} - $user_new{$key}) *
+                    ($user_old{sessions} / $user_new{sessions});
+            }
+            # store updated user
+            $load{$uid} = join(" ", map {"$_:$user_new{$_}"} keys(%user_new));
+        } else {
+            $load{$uid} = $user_new;
+            $load{users}++;
+        }
+    }
+    # delete stale data that has not been updated
+    foreach my $key (keys %load_old) {
+        delete $load{"$host:$key"} if (!exists $load_new{$key});
+    }
+    $sync->UnLock;
+}
+
+# convert relevant config to Net::Server namespace
+my %net_server;
+$net_server{allow} = $conf{tcp_allow} if ($conf{tcp_allow});
+$net_server{deny} = $conf{tcp_deny} if ($conf{tcp_deny});
+$net_server{group} = $conf{run_group} if ($conf{run_group});
+$net_server{log_file} = $conf{log_file} if ($conf{log_file});
+$net_server{log_level} = $conf{log_level} if ($conf{log_level});
+$net_server{pid_file} = $conf{pid_file} if ($conf{pid_file});
+$net_server{port} = $conf{data_port} if ($conf{data_port});
+$net_server{setsid} = $conf{run_setsid} if ($conf{run_setsid});
+$net_server{syslog_facility} = $conf{syslog_facility}
+    if ($conf{syslog_facility});
+$net_server{syslog_ident} = $conf{syslog_ident} if ($conf{syslog_ident});
+$net_server{syslog_logopt} = $conf{syslog_logopt} if ($conf{syslog_logopt});
+$net_server{user} = $conf{run_user} if ($conf{run_user});
+
+# set server type
+if ($conf{run_fork_max} == 1) {
+    $net_server{server_type} = 'Multiplex';
+} elsif ($conf{run_fork_min} > 0 && $conf{run_fork_max} > $conf{run_fork_min}) {
+    $net_server{min_servers} = $conf{run_fork_min};
+    $net_server{max_servers} = $conf{run_fork_max};
+    $net_server{server_type} = 'PreFork';
+} elsif ($conf{run_fork_min} > 0) {
+    $net_server{max_servers} = $conf{run_fork_min};
+    $net_server{server_type} = 'PreForkSimple';
+} else {
+    $net_server{server_type} = 'Fork';
+    $net_server{max_servers} = $conf{run_fork_max} if ($conf{run_fork_max} > 0);
+}
+
+# start server
+Ballast->run(%net_server);
+
+1;
+
